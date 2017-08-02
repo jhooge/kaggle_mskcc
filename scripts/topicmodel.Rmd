@@ -1,0 +1,167 @@
+---
+title: "Topic Modeling for the 'Personalized Medicine: Redefining Cancer Treatment' Challenge"
+author: "Jens Hooge"
+date: "01.08.2017"
+output: html_document
+  number_sections: true
+  toc: true
+  fig_width: 7
+  fig_height: 4.5
+  theme: cosmo
+  highlight: tango
+---
+
+# Introduction
+Topic models are probabilistic latent variable models of documents that exploit the correlations among the words and latent semantic themes” (Blei and Lafferty, 2007). The name "topics" signifies the hidden, to be estimated, variable relations (=distributions) that link words in a vocabulary and their occurrence in documents. A document is seen as a mixture of topics. This intuitive explanation of how documents can be generated is modeled as a stochastic process which is then "reversed"" (Blei and Lafferty, 2009) by machine learning techniques that return estimates of the latent variables. With these estimates it is possible to perform information retrieval or text mining tasks on a document corpus.
+
+# Loading required libraries
+In this study we will utilize R tm R package for querying and textmining of the literature evidence for each of the classes in the [Personalized Medicine: Redefining Cancer Treatment]() challenge on kaggle
+```{r, warning=FALSE, message=FALSE}
+library(tm) ## texmining
+library(lda) ## the actual LDA model
+library(LDAvis) # visualization library for LDA
+
+library(parallel) # multi-core paralellization
+
+library(data.table) # fread
+library(Rmpfr) # harmonic mean maximization
+library(ggplot2) # pretty plotting lib
+library(reshape2) # reformatting lib for ggplot2
+
+library(tsne) # low dimensional embedding
+library(caret) # ml model wrapper lib, but only used for data transformation here
+
+library(rbokeh) # pretty (interactive) plotting
+```
+
+# Helper Functions
+```{r}
+#' Copy arguments into env and re-bind any function's lexical scope to bindTargetEnv .
+#' 
+#' See http://winvector.github.io/Parallel/PExample.html for example use.
+#' 
+#' 
+#' Used to send data along with a function in situations such as parallel execution 
+#' (when the global environment would not be available).  Typically called within 
+#' a function that constructs the worker function to pass to the parallel processes
+#' (so we have a nice lexical closure to work with).
+#' 
+#' @param bindTargetEnv environment to bind to
+#' @param objNames additional names to lookup in parent environment and bind
+#' @param names of functions to NOT rebind the lexical environments of
+bindToEnv <- function(bindTargetEnv=parent.frame(), objNames, doNotRebind=c()) {
+  # Bind the values into environment
+  # and switch any functions to this environment!
+  for(var in objNames) {
+    val <- get(var, envir=parent.frame())
+    if(is.function(val) && (!(var %in% doNotRebind))) {
+      # replace function's lexical environment with our target (DANGEROUS)
+      environment(val) <- bindTargetEnv
+    }
+    # assign object to target environment, only after any possible alteration
+    assign(var, val, envir=bindTargetEnv)
+  }
+}
+
+startCluster <- function(cores=detectCores()) {
+  cluster <- makeCluster(cores)
+  return(cluster)
+}
+
+shutDownCluster <- function(cluster) {
+  if(!is.null(cluster)) {
+    stopCluster(cluster)
+    cluster <- c()
+  }
+}
+
+get.terms <- function(x) {
+  index <- match(x, vocab)
+  index <- index[!is.na(index)]
+  rbind(as.integer(index - 1), as.integer(rep(1, length(index))))
+}
+```
+
+First we will read the text data for the training and test datasets.
+```{r}
+## Read text data
+train_txt_dump <- data.frame(text = read_lines('../data/original/training_text', skip = 1))
+train_txt <- train_txt_dump %>%
+  separate(text, into = c("ID", "txt"), sep = "\\|\\|")
+train_txt <- train_txt %>%
+  mutate(ID = as.integer(ID))
+
+test_txt_dump <- data.frame(text = read_lines('../data/original/test_text', skip = 1))
+test_txt <- test_txt_dump %>%
+  separate(text, into = c("ID", "txt"), sep = "\\|\\|")
+test_txt <- test_txt %>%
+  mutate(ID = as.integer(ID))
+
+stop_words <- stopwords("SMART")
+docs <- gsub("[[:punct:]]", " ", docs)  # replace punctuation with space
+docs <- gsub("[[:cntrl:]]", " ", docs)  # replace control characters with space
+docs <- gsub("^[[:space:]]+", "", docs) # remove whitespace at beginning of documents
+docs <- gsub("[[:space:]]+$", "", docs) # remove whitespace at end of documents
+docs <- tolower(docs)  # force to lowercase
+```
+
+# Preprocessing
+To train the LDA in the later steps, we need the word frequencies in each of those abstracts. For representative word frequencies we removed a number of problematic characters, removed punctuation, control characters, whitespaces, stopwords which belonged to the SMART stopword collection, all words with less than 4 characters and words which occurred less than 4 times in the documents. Lastly we transformed each word to lowercase.
+
+```{r, eval=FALSE}
+stop_words <- stopwords("SMART")
+docs <- gsub("[[:punct:]]", " ", docs)  # replace punctuation with space
+docs <- gsub("[[:cntrl:]]", " ", docs)  # replace control characters with space
+docs <- gsub("^[[:space:]]+", "", docs) # remove whitespace at beginning of documents
+docs <- gsub("[[:space:]]+$", "", docs) # remove whitespace at end of documents
+docs <- tolower(docs)  # force to lowercase
+
+# tokenize on space and output as a list:
+doc.list <- strsplit(docs, "[[:space:]]+")
+
+# Remove all words with less than 4 characters
+doc.list <- lapply(doc.list, function(x) x[sapply(x, nchar)>3])
+
+# compute the table of terms:
+term.table <- table(unlist(doc.list))
+term.table <- sort(term.table, decreasing = TRUE)
+
+# remove terms that are stop words or occur fewer than 5 times:
+del <- names(term.table) %in% stop_words | term.table < 5
+term.table <- term.table[!del]
+vocab <- names(term.table)
+
+save(vocab, file="../data/derived/vocab.rda")
+save(term.table, file="../data/derived/termTable.rda")
+```
+
+```{r, eval=TRUE}
+load("../data/derived/vocab.rda")
+load("../data/derived/termTable.rda")
+```
+
+Next we reformated the documents into the format required by the lda package.
+```{r, eval=FALSE}
+documents <- lapply(doc.list, get.terms)
+
+save(documents, file="documents.rda")
+```
+
+Before we start training our LDA, we first will calculate some statistics related to the data set:
+```{r}
+D <- length(documents)  # number of documents
+W <- length(vocab)  # number of terms in the vocab
+doc.length <- sapply(documents, function(x) sum(x[2, ]))  # number of tokens per document
+N <- sum(doc.length)  # total number of tokens in the data
+term.frequency <- as.integer(term.table)  # frequencies of terms in the corpus
+```
+
+```{r}
+df <- data.frame("Number of Documents"=D, 
+                 "Number of Terms in Vocabulary"=W,
+                 "Total Number of Tokens in Corpus"=N)
+
+knitr::kable(df, digits = 0, caption = "Document Statistics")
+```
+
+
